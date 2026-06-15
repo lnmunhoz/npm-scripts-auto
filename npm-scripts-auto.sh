@@ -11,10 +11,6 @@ zmodload zsh/stat 2>/dev/null || true
 
 # Associative array to track dynamically created commands
 typeset -A _npm_script_cmds
-typeset _npm_scripts_async_pid=""
-typeset _npm_scripts_async_file=""
-typeset _npm_scripts_async_dir=""
-typeset _npm_scripts_pending_sig=""
 typeset _npm_scripts_loaded_sig=""
 
 _npm_scripts_detect_package_manager() {
@@ -119,45 +115,26 @@ _npm_scripts_package_signature() {
     echo "${PWD}:${mtime}:${size}"
 }
 
-_npm_scripts_cleanup_async_state() {
-    if [[ -n "$_npm_scripts_async_file" && -f "$_npm_scripts_async_file" ]]; then
-        rm -f "$_npm_scripts_async_file"
-    fi
-    _npm_scripts_async_pid=""
-    _npm_scripts_async_file=""
-    _npm_scripts_async_dir=""
-    _npm_scripts_pending_sig=""
-}
-
-_npm_scripts_apply_async_update() {
-    local scripts_file=$1
-    local scripts
-    scripts=("${(@f)$(<"$scripts_file")}")
-
+_npm_scripts_apply_scripts() {
     _npm_scripts_clear_dynamic_commands
 
     local script
-    for script in $scripts; do
+    for script in "$@"; do
         eval "function $script() { local package_manager; package_manager=\$(_npm_scripts_detect_package_manager); \$package_manager run $script \"\$@\" }"
         _npm_script_cmds[$script]=1
         _generate_npm_script_completion "$script"
     done
 
-    if [[ ${#scripts[@]} -gt 0 && "$NPM_SCRIPTS_AUTO_VERBOSE" == "1" ]]; then
+    if [[ $# -gt 0 && "$NPM_SCRIPTS_AUTO_VERBOSE" == "1" ]]; then
         local package_manager
         package_manager=$(_npm_scripts_detect_package_manager)
         echo "⚡ ${package_manager} scripts loaded. Type 'scripts' to view all."
     fi
 }
 
-# Start parsing package.json scripts in background.
+# Parse package.json scripts and register commands.
 _npm_scripts_start_async_update() {
     if [[ ! -f package.json ]]; then
-        if [[ -n "$_npm_scripts_async_pid" ]]; then
-            kill "$_npm_scripts_async_pid" 2>/dev/null
-            wait "$_npm_scripts_async_pid" 2>/dev/null
-        fi
-        _npm_scripts_cleanup_async_state
         _npm_scripts_loaded_sig=""
         _npm_scripts_clear_dynamic_commands
         return
@@ -166,49 +143,25 @@ _npm_scripts_start_async_update() {
     local sig
     sig=$(_npm_scripts_package_signature) || return
 
-    if [[ "$sig" == "$_npm_scripts_loaded_sig" || "$sig" == "$_npm_scripts_pending_sig" ]]; then
+    if [[ "$sig" == "$_npm_scripts_loaded_sig" ]]; then
         return
     fi
 
-    if [[ -n "$_npm_scripts_async_pid" ]]; then
-        kill "$_npm_scripts_async_pid" 2>/dev/null
-        wait "$_npm_scripts_async_pid" 2>/dev/null
-        _npm_scripts_cleanup_async_state
-    fi
+    local scripts
+    scripts=("${(@f)$(jq -r '.scripts | keys[]' package.json 2>/dev/null)}")
 
-    local output_file
-    output_file="${TMPDIR:-/tmp}/npm-scripts-auto.${EPOCHREALTIME//./}.$$.$RANDOM"
-
-    (jq -r '.scripts | keys[]' package.json 2>/dev/null >| "$output_file") &!
-
-    _npm_scripts_async_pid=$!
-    _npm_scripts_async_file="$output_file"
-    _npm_scripts_async_dir="$PWD"
-    _npm_scripts_pending_sig="$sig"
+    _npm_scripts_apply_scripts "${scripts[@]}"
+    _npm_scripts_loaded_sig="$sig"
 }
 
-# Apply background parse results once they are ready.
+# Removed from hooks when re-sourcing shells that loaded older async versions.
 _npm_scripts_poll_async_update() {
-    [[ -n "$_npm_scripts_async_pid" ]] || return
-
-    if kill -0 "$_npm_scripts_async_pid" 2>/dev/null; then
-        return
-    fi
-
-    wait "$_npm_scripts_async_pid" 2>/dev/null
-    local exit_code=$?
-
-    if [[ "$_npm_scripts_async_dir" == "$PWD" && $exit_code -eq 0 && -f "$_npm_scripts_async_file" ]]; then
-        _npm_scripts_apply_async_update "$_npm_scripts_async_file"
-        _npm_scripts_loaded_sig="$_npm_scripts_pending_sig"
-    fi
-
-    _npm_scripts_cleanup_async_state
+    return 0
 }
 
 # Hooks
 add-zsh-hook chpwd _npm_scripts_start_async_update
-add-zsh-hook precmd _npm_scripts_poll_async_update
+add-zsh-hook -d precmd _npm_scripts_poll_async_update 2>/dev/null || true
 
-# Trigger async parse on shell startup (non-blocking)
+# Trigger parse on shell startup
 _npm_scripts_start_async_update
